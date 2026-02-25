@@ -1,0 +1,16 @@
+syntax = "proto3";
+package worldmonitor.news.v1;
+
+// TechNewsEntry එකක n8n එකට අවශ්‍ය දත්ත අඩංගු වේ
+message TechNewsEntry {
+  string heading = 1;      // පුවතේ සිරස්තලය
+  string image_url = 2;    // රූපයේ ලින්ක් එක
+  string summary = 3;      // කෙටි විස්තරය
+  string source_url = 4;   // මුල් පුවතේ ලින්ක් එක
+}
+
+message ListTechNewsRequest {}
+
+message ListTechNewsResponse {
+  repeated TechNewsEntry entries = 1;
+}
