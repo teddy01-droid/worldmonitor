@@ -108,6 +108,16 @@ function escapeXml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// ── Text Similarity (for copyright check) ───────────────────────────
+
+function calculateSimilarity(textA, textB) {
+    const wordsA = new Set(textA.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length >= 3));
+    const wordsB = new Set(textB.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length >= 3));
+    if (wordsA.size === 0 || wordsB.size === 0) return 0;
+    const intersection = [...wordsA].filter(w => wordsB.has(w));
+    return intersection.length / Math.max(wordsA.size, wordsB.size);
+}
+
 // ── Smart Tech Filtering (World Monitor tech variant pattern) ───────
 
 const TECH_KEYWORDS = new Set([
@@ -640,10 +650,10 @@ async function handleTechNews(urlObj) {
     };
 }
 
-// AI-processed endpoint
+// AI-processed endpoint — STRICT: no fallback to original content (copyright protection)
 async function handleGenerateTechNews(urlObj) {
     if (!GEMINI_API_KEY) {
-        return { status: 500, body: { error: 'GEMINI_API_KEY not configured. Set it in Railway environment variables.' } };
+        return { status: 503, body: { error: 'GEMINI_API_KEY not configured. Set it in Railway environment variables.', ok: false } };
     }
 
     const limit = Math.min(parseInt(urlObj.searchParams.get('limit') || '1', 10), 5);
@@ -651,63 +661,100 @@ async function handleGenerateTechNews(urlObj) {
     const allItems = await fetchAllFeeds(sourceFilter);
 
     if (allItems.length === 0) {
-        return { status: 404, body: { error: 'No tech news found', sources: FEEDS.map(f => f.key) } };
+        return { status: 404, body: { error: 'No tech news found after pipeline filtering', ok: false, sources: FEEDS.map(f => f.key) } };
     }
 
-    const toProcess = allItems.slice(0, limit);
+    const toProcess = allItems.slice(0, limit + 3); // fetch extra candidates in case some fail
     const articles = [];
 
     for (const item of toProcess) {
+        if (articles.length >= limit) break; // got enough
+
         try {
             console.log(`[Generate] Processing: ${item.title}`);
 
             // 1. Scrape full article
             const fullContent = await scrapeFullArticle(item.link);
 
-            // 2. Generate title + summary with Gemini
+            // 2. Generate title + summary with Gemini — MUST succeed
             const ai = await generateTitleAndSummary(fullContent, item.title, item.source, item.summary);
 
-            // 3. Generate brand-consistent SVG image
-            const svgCard = generateBrandCard(ai.title || item.title, item.source, item.publishedAt);
+            // 3. STRICT VALIDATION: AI must produce original content
+            if (!ai.title || !ai.summary) {
+                console.warn(`[Generate] ✗ Gemini returned empty — skipping: ${item.title}`);
+                continue;
+            }
+
+            // Check title is actually different from original (copyright safety)
+            const titleSimilarity = calculateSimilarity(ai.title, item.title);
+            if (titleSimilarity > 0.8) {
+                console.warn(`[Generate] ✗ Title too similar to original (${(titleSimilarity * 100).toFixed(0)}%) — skipping`);
+                continue;
+            }
+
+            // Validate summary word count (50-150 words)
+            const wordCount = ai.summary.split(/\s+/).length;
+            if (wordCount < 30 || wordCount > 200) {
+                console.warn(`[Generate] ⚠ Summary word count ${wordCount} — outside 50-150 range but proceeding`);
+            }
+
+            // 4. Generate brand-consistent SVG card using AI-generated title
+            const svgCard = generateBrandCard(ai.title, item.source, item.publishedAt);
             const imageDataUri = svgToBase64DataUri(svgCard);
 
             articles.push({
-                title: ai.title || item.title,
-                summary: ai.summary || item.summary,
+                // AI-generated original content (copyright-safe)
+                title: ai.title,
+                summary: ai.summary,
                 image: imageDataUri,
                 source: item.source,
                 sourceUrl: item.link,
-                originalTitle: item.title,
-                publishedAt: item.publishedAt,
+
+                // Pipeline intelligence metadata
+                techScore: item.techScore || 0,
+                velocity: item.velocity || 1,
+                trending: item.trending || false,
+
+                // Meta
+                wordCount,
                 generatedAt: new Date().toISOString(),
-                wordCount: (ai.summary || '').split(/\s+/).length,
+                publishedAt: item.publishedAt,
             });
 
-            console.log(`[Generate] ✓ Done: ${ai.title}`);
+            console.log(`[Generate] ✓ Done: "${ai.title}" (${wordCount} words, techScore=${item.techScore}, velocity=${item.velocity})`);
+
         } catch (err) {
-            console.error(`[Generate] ✗ Failed: ${item.title}`, err.message);
-
-            // Still include with original content as fallback
-            const svgCard = generateBrandCard(item.title, item.source, item.publishedAt);
-            articles.push({
-                title: item.title,
-                summary: item.summary,
-                image: svgToBase64DataUri(svgCard),
-                source: item.source,
-                sourceUrl: item.link,
-                originalTitle: item.title,
-                publishedAt: item.publishedAt,
-                generatedAt: new Date().toISOString(),
-                wordCount: (item.summary || '').split(/\s+/).length,
-                error: err.message,
-            });
+            // STRICT: Do NOT fallback to original content — skip this article
+            console.error(`[Generate] ✗ STOPPED: ${item.title} — ${err.message}`);
+            // Try next article in the queue
+            continue;
         }
+    }
+
+    // If no articles could be generated, return error
+    if (articles.length === 0) {
+        return {
+            status: 503,
+            body: {
+                ok: false,
+                error: 'AI generation failed for all articles. Gemini API may be rate-limited. No original content returned to protect copyright.',
+                retryAfter: 60,
+            },
+        };
     }
 
     return {
         status: 200,
         body: {
+            ok: true,
             articles,
+            pipeline: {
+                feedsSources: FEEDS.map(f => f.name),
+                smartFilter: true,
+                velocityAnalysis: true,
+                clustering: true,
+                brandTemplate: 'TECH PULSE',
+            },
             generatedAt: new Date().toISOString(),
             count: articles.length,
             model: 'gemini-2.0-flash',
