@@ -431,7 +431,7 @@ async function scrapeFullArticle(url) {
     }
 }
 
-// ── Gemini API (with retry + cache) ─────────────────────────────────
+// ── Gemini API (with adaptive retry + cache + fallback) ─────────────
 
 // In-memory cache — avoids duplicate API calls (30 min TTL)
 const geminiCache = new Map();
@@ -456,37 +456,75 @@ async function callGemini(systemPrompt, userPrompt, jsonMode = false) {
         },
     };
 
-    const MAX_RETRIES = 3;
-    const BASE_DELAY = 2000; // 2 seconds
+    const MAX_RETRIES = 4;
+    const INITIAL_DELAY = 5000; // 5 seconds
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-                signal: AbortSignal.timeout(30000),
+    // Attempt with 2.0-flash first, fallback to 1.5-flash if needed
+    let models = ['gemini-2.0-flash', 'gemini-1.5-flash'];
+
+    for (const model of models) {
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                const response = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                        signal: AbortSignal.timeout(35000),
+                    }
+                );
+
+                if (response.ok) {
+                    const data = await response.json();
+                    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                    return stripReasoningPreamble(text);
+                }
+
+                // Error handling
+                const errData = await response.json().catch(() => ({}));
+                const errMessage = errData?.error?.message || 'Unknown error';
+                const status = response.status;
+
+                if (status === 429 || status >= 500) {
+                    // Try to parse retry delay from Google's response (e.g. "22.6s")
+                    let waitMs = INITIAL_DELAY * Math.pow(2, attempt - 1);
+
+                    // Look for rpc.RetryInfo or seconds in message
+                    const retryInfo = errData?.error?.details?.find(d => d['@type']?.includes('RetryInfo'));
+                    if (retryInfo?.retryDelay) {
+                        const seconds = parseFloat(retryInfo.retryDelay);
+                        if (!isNaN(seconds)) waitMs = (seconds + 1) * 1000;
+                    } else {
+                        // Regex search in message for "retry in X.Xs"
+                        const match = errMessage.match(/retry in ([\d.]+)s/i);
+                        if (match) waitMs = (parseFloat(match[1]) + 2) * 1000;
+                    }
+
+                    console.warn(`[Gemini] ${model} ${status}: ${errMessage.slice(0, 100)}...`);
+                    console.warn(`[Gemini] Waiting ${Math.round(waitMs / 1000)}s before retry (attempt ${attempt}/${MAX_RETRIES})`);
+
+                    await sleep(waitMs);
+                    continue;
+                }
+
+                throw new Error(`Gemini ${model} error ${status}: ${JSON.stringify(errData)}`);
+            } catch (err) {
+                if (attempt === MAX_RETRIES) {
+                    if (model === models[0]) {
+                        console.error(`[Gemini] ${model} failed after ${MAX_RETRIES} attempts. Falling back to next model...`);
+                        break; // Move to next model
+                    }
+                    throw err; // Final failure
+                }
+                if (err.name === 'TimeoutError' || err.message.includes('timeout')) {
+                    console.warn(`[Gemini] Timeout on ${model}, retrying...`);
+                    await sleep(INITIAL_DELAY);
+                    continue;
+                }
+                throw err;
             }
-        );
-
-        if (response.ok) {
-            const data = await response.json();
-            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            return stripReasoningPreamble(text);
         }
-
-        // Rate limit or server error — retry with backoff
-        if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-            const delay = BASE_DELAY * Math.pow(2, attempt - 1); // 2s, 4s, 8s
-            console.warn(`[Gemini] ${response.status} — retrying in ${delay / 1000}s (attempt ${attempt}/${MAX_RETRIES})`);
-            await sleep(delay);
-            continue;
-        }
-
-        // Final attempt failed or non-retryable error
-        const err = await response.text();
-        throw new Error(`Gemini API error ${response.status} after ${attempt} attempts: ${err}`);
     }
 }
 
