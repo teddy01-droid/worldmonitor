@@ -49,6 +49,69 @@ const BRAND = {
     height: 630,
 };
 
+// ── Brand Image Prompt Builder (DNA Consistency) ────────────────────
+
+/**
+ * Builds a detailed image generation prompt for n8n's Gemini Image node.
+ * Enforces DNA brand consistency — every generated image follows the same
+ * visual identity: dark tech aesthetic, neon accents, clean minimalist style.
+ */
+function buildBrandImagePrompt(title, summary, source) {
+    // Extract key visual concept from the title
+    const topic = title.toLowerCase();
+    let visualConcept = 'futuristic technology interface';
+
+    if (topic.includes('ai') || topic.includes('artificial') || topic.includes('machine learning') || topic.includes('neural')) {
+        visualConcept = 'neural network nodes glowing with data connections, AI brain visualization';
+    } else if (topic.includes('chip') || topic.includes('semiconductor') || topic.includes('processor') || topic.includes('gpu')) {
+        visualConcept = 'close-up of a glowing microchip with circuit traces, semiconductor wafer';
+    } else if (topic.includes('robot') || topic.includes('autonomous') || topic.includes('self-driving')) {
+        visualConcept = 'sleek autonomous robot or self-driving vehicle with sensor beams';
+    } else if (topic.includes('space') || topic.includes('rocket') || topic.includes('satellite') || topic.includes('nasa')) {
+        visualConcept = 'spacecraft or satellite orbiting Earth with starfield background';
+    } else if (topic.includes('phone') || topic.includes('iphone') || topic.includes('android') || topic.includes('mobile')) {
+        visualConcept = 'modern smartphone with holographic UI projections';
+    } else if (topic.includes('crypto') || topic.includes('blockchain') || topic.includes('bitcoin')) {
+        visualConcept = 'blockchain network visualization with floating data blocks';
+    } else if (topic.includes('cloud') || topic.includes('server') || topic.includes('data center')) {
+        visualConcept = 'futuristic server room with glowing racks and data streams';
+    } else if (topic.includes('cyber') || topic.includes('hack') || topic.includes('security') || topic.includes('breach')) {
+        visualConcept = 'digital shield or lock with cyber defense grid visualization';
+    } else if (topic.includes('startup') || topic.includes('funding') || topic.includes('raised') || topic.includes('billion')) {
+        visualConcept = 'abstract growth chart with ascending data particles and innovation symbols';
+    } else if (topic.includes('apple') || topic.includes('macbook') || topic.includes('ipad')) {
+        visualConcept = 'premium tech device on a sleek dark surface with ambient lighting';
+    } else if (topic.includes('google') || topic.includes('search') || topic.includes('meta')) {
+        visualConcept = 'interconnected data nodes representing a global tech network';
+    } else if (topic.includes('electric') || topic.includes('tesla') || topic.includes('ev') || topic.includes('battery')) {
+        visualConcept = 'electric vehicle charging with energy flow visualization';
+    }
+
+    return `Create a professional social media post image (1200x630 pixels, landscape format) for a Facebook tech news page.
+
+BRAND IDENTITY (MUST follow exactly):
+- Background: Deep dark navy/black gradient (#0a0a14 to #0d0d20)
+- Primary accent color: Neon cyan (#00d4ff) for highlights and glows
+- Secondary accent: Electric purple (#7c3aed) for depth
+- Style: Ultra-modern, clean, minimalist, premium tech aesthetic
+- Lighting: Dramatic ambient glow, subtle neon edge lighting
+- Mood: Sophisticated, cutting-edge, futuristic
+
+VISUAL CONTENT:
+- Main subject: ${visualConcept}
+- The image should visually represent: "${title}"
+- Add subtle geometric patterns or grid lines in the background (very low opacity)
+- Use depth of field — main subject sharp, background softly blurred
+
+STRICT RULES:
+- NO text, NO letters, NO words, NO logos, NO watermarks in the image
+- NO hands or human faces
+- Keep it abstract and conceptual
+- Must look professional enough for a premium tech brand
+- Color palette MUST use dark backgrounds with cyan and purple neon accents
+- Every image must feel like it belongs to the same brand family`;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 async function fetchWithTimeout(url, timeoutMs = 12000) {
@@ -698,15 +761,14 @@ async function handleGenerateTechNews(urlObj) {
                 console.warn(`[Generate] ⚠ Summary word count ${wordCount} — outside 50-150 range but proceeding`);
             }
 
-            // 4. Generate brand-consistent SVG card using AI-generated title
-            const svgCard = generateBrandCard(ai.title, item.source, item.publishedAt);
-            const imageDataUri = svgToBase64DataUri(svgCard);
+            // 4. Generate brand-consistent image prompt for n8n Gemini Image node
+            const imagePrompt = buildBrandImagePrompt(ai.title, ai.summary, item.source);
 
             articles.push({
                 // AI-generated original content (copyright-safe)
                 title: ai.title,
                 summary: ai.summary,
-                image: imageDataUri,
+                imagePrompt,
                 source: item.source,
                 sourceUrl: item.link,
 
