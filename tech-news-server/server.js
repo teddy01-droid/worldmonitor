@@ -431,7 +431,13 @@ async function scrapeFullArticle(url) {
     }
 }
 
-// ── Gemini API ──────────────────────────────────────────────────────
+// ── Gemini API (with retry + cache) ─────────────────────────────────
+
+// In-memory cache — avoids duplicate API calls (30 min TTL)
+const geminiCache = new Map();
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function callGemini(systemPrompt, userPrompt, jsonMode = false) {
     if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
@@ -450,27 +456,49 @@ async function callGemini(systemPrompt, userPrompt, jsonMode = false) {
         },
     };
 
-    const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(30000),
+    const MAX_RETRIES = 3;
+    const BASE_DELAY = 2000; // 2 seconds
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(30000),
+            }
+        );
+
+        if (response.ok) {
+            const data = await response.json();
+            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            return stripReasoningPreamble(text);
         }
-    );
 
-    if (!response.ok) {
+        // Rate limit or server error — retry with backoff
+        if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
+            const delay = BASE_DELAY * Math.pow(2, attempt - 1); // 2s, 4s, 8s
+            console.warn(`[Gemini] ${response.status} — retrying in ${delay / 1000}s (attempt ${attempt}/${MAX_RETRIES})`);
+            await sleep(delay);
+            continue;
+        }
+
+        // Final attempt failed or non-retryable error
         const err = await response.text();
-        throw new Error(`Gemini API error ${response.status}: ${err}`);
+        throw new Error(`Gemini API error ${response.status} after ${attempt} attempts: ${err}`);
     }
-
-    const data = await response.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    return stripReasoningPreamble(text);
 }
 
 async function generateTitleAndSummary(articleContent, originalTitle, source, rssSummary) {
+    // Check cache first
+    const cacheKey = originalTitle.slice(0, 100);
+    const cached = geminiCache.get(cacheKey);
+    if (cached && (Date.now() - cached.time < CACHE_TTL)) {
+        console.log(`[Gemini] Cache hit for: ${originalTitle.slice(0, 50)}...`);
+        return cached.data;
+    }
+
     const dateContext = `Current date: ${new Date().toISOString().split('T')[0]}.`;
 
     const systemPrompt = `${dateContext}
@@ -505,23 +533,28 @@ Generate a new original title and 50-150 word summary.`;
 
     const raw = await callGemini(systemPrompt, userPrompt, true);
 
+    let result;
     try {
-        const parsed = JSON.parse(raw);
-        // Validate summary word count
-        const wordCount = parsed.summary.split(/\s+/).length;
-        if (wordCount < 30 || wordCount > 200) {
-            console.warn(`[Gemini] Summary word count out of range: ${wordCount}`);
-        }
-        return parsed;
+        result = JSON.parse(raw);
     } catch {
         // Try to extract from non-JSON response
         const titleMatch = raw.match(/"title"\s*:\s*"([^"]+)"/);
         const summaryMatch = raw.match(/"summary"\s*:\s*"([^"]+)"/);
-        return {
-            title: titleMatch ? titleMatch[1] : originalTitle,
-            summary: summaryMatch ? summaryMatch[1] : rssSummary,
-        };
+        if (!titleMatch || !summaryMatch) {
+            throw new Error('Gemini returned unparseable response — cannot generate original content');
+        }
+        result = { title: titleMatch[1], summary: summaryMatch[1] };
     }
+
+    // STRICT: must have both title and summary
+    if (!result.title || !result.summary) {
+        throw new Error('Gemini returned incomplete response — missing title or summary');
+    }
+
+    // Cache successful result
+    geminiCache.set(cacheKey, { data: result, time: Date.now() });
+
+    return result;
 }
 
 // ── SVG Brand Card Generator (inspired by World Monitor og-story.js) ─
