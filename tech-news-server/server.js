@@ -857,6 +857,218 @@ async function handleGenerateTechNews(urlObj) {
     };
 }
 
+// ── Step-by-Step Handlers (for n8n pipeline with 30s delays) ────────
+
+/**
+ * Step 1: Pick the top article from RSS pipeline (no Gemini call)
+ * Returns: article data + full scraped content
+ */
+async function handleStepPick(urlObj) {
+    const allItems = await fetchAllFeeds();
+    if (allItems.length === 0) {
+        return { status: 404, body: { ok: false, error: 'No tech news found after pipeline filtering' } };
+    }
+    const article = allItems[0]; // top-ranked by tech score + velocity + freshness
+
+    // Scrape full content (no Gemini needed)
+    let fullContent = '';
+    try {
+        fullContent = await scrapeFullArticle(article.link);
+    } catch (e) {
+        console.warn(`[Step1] Scrape failed: ${e.message}, using RSS summary`);
+    }
+
+    return {
+        status: 200,
+        body: {
+            ok: true,
+            step: 1,
+            article: {
+                originalTitle: article.title,
+                rssSummary: article.summary || '',
+                fullContent: (fullContent || article.summary || article.title).slice(0, 6000),
+                source: article.source,
+                sourceUrl: article.link,
+                publishedAt: article.publishedAt,
+                techScore: article.techScore || 0,
+                velocity: article.velocity || 1,
+                trending: article.trending || false,
+            },
+        },
+    };
+}
+
+/**
+ * Step 2: Generate AI title (1 Gemini call)
+ * Input: originalTitle, source, fullContent (from Step 1)
+ */
+async function handleStepTitle(urlObj) {
+    if (!GEMINI_API_KEY) {
+        return { status: 503, body: { ok: false, error: 'GEMINI_API_KEY not configured' } };
+    }
+
+    const originalTitle = urlObj.searchParams.get('originalTitle') || '';
+    const source = urlObj.searchParams.get('source') || '';
+    const fullContent = urlObj.searchParams.get('fullContent') || '';
+
+    if (!originalTitle) {
+        return { status: 400, body: { ok: false, error: 'Missing originalTitle parameter' } };
+    }
+
+    const systemPrompt = `You are a senior tech editor for "TECH PULSE" Facebook page.
+Generate a NEW, ORIGINAL, catchy title for this tech news article.
+Rules:
+- Must be completely different from the original — rewrite in your own words
+- Make it click-worthy for Facebook audience
+- NEVER start with "Breaking:" or "Just in:" 
+- No hashtags
+- Output ONLY the title text, nothing else`;
+
+    const userPrompt = `Original Title: ${originalTitle}
+Source: ${source}
+Article Content: ${fullContent.slice(0, 4000)}
+
+Write a new original title:`;
+
+    const aiTitle = await callGemini(systemPrompt, userPrompt);
+    const cleanTitle = aiTitle.replace(/^["']|["']$/g, '').trim();
+
+    // Validate it's actually different
+    const similarity = calculateSimilarity(cleanTitle, originalTitle);
+    if (similarity > 0.8) {
+        return { status: 422, body: { ok: false, error: `Title too similar to original (${(similarity * 100).toFixed(0)}%)`, retryAfter: 5 } };
+    }
+
+    return {
+        status: 200,
+        body: {
+            ok: true,
+            step: 2,
+            title: cleanTitle,
+            originalTitle,
+            similarity: `${(similarity * 100).toFixed(0)}%`,
+        },
+    };
+}
+
+/**
+ * Step 3: Generate AI summary (1 Gemini call)
+ * Input: title (AI-generated from Step 2), originalTitle, source, fullContent
+ */
+async function handleStepSummary(urlObj) {
+    if (!GEMINI_API_KEY) {
+        return { status: 503, body: { ok: false, error: 'GEMINI_API_KEY not configured' } };
+    }
+
+    const title = urlObj.searchParams.get('title') || '';
+    const source = urlObj.searchParams.get('source') || '';
+    const fullContent = urlObj.searchParams.get('fullContent') || '';
+
+    if (!title) {
+        return { status: 400, body: { ok: false, error: 'Missing title parameter (from step 2)' } };
+    }
+
+    const systemPrompt = `You are a senior tech editor for "TECH PULSE" Facebook page.
+Write a NEW, ORIGINAL summary (50-150 words) for this article.
+Rules:
+- Informative, engaging, written in your own words
+- Focus: what happened, why it matters, what's next
+- Professional but accessible tone
+- No hashtags, no clichés
+- Output ONLY the summary text, nothing else`;
+
+    const userPrompt = `Title: ${title}
+Source: ${source}
+Article Content: ${fullContent.slice(0, 5000)}
+
+Write a 50-150 word original summary:`;
+
+    const aiSummary = await callGemini(systemPrompt, userPrompt);
+    const cleanSummary = aiSummary.replace(/^["']|["']$/g, '').trim();
+
+    const wordCount = cleanSummary.split(/\s+/).length;
+    if (wordCount < 20) {
+        return { status: 422, body: { ok: false, error: `Summary too short (${wordCount} words)`, retryAfter: 5 } };
+    }
+
+    return {
+        status: 200,
+        body: {
+            ok: true,
+            step: 3,
+            summary: cleanSummary,
+            wordCount,
+            source,
+        },
+    };
+}
+
+/**
+ * Step 4: Generate brand-consistent image prompt (NO Gemini call — just builds prompt)
+ * Input: title, summary (from Steps 2-3)
+ */
+async function handleStepImagePrompt(urlObj) {
+    const title = urlObj.searchParams.get('title') || '';
+    const summary = urlObj.searchParams.get('summary') || '';
+    const source = urlObj.searchParams.get('source') || '';
+
+    if (!title) {
+        return { status: 400, body: { ok: false, error: 'Missing title parameter' } };
+    }
+
+    const imagePrompt = buildBrandImagePrompt(title, summary, source);
+
+    return {
+        status: 200,
+        body: {
+            ok: true,
+            step: 4,
+            imagePrompt,
+        },
+    };
+}
+
+/**
+ * Step 5: Compose final Facebook post (NO Gemini call — assembles everything)
+ * Input: title, summary, source, sourceUrl, imagePrompt
+ */
+async function handleStepCompose(urlObj) {
+    const title = urlObj.searchParams.get('title') || '';
+    const summary = urlObj.searchParams.get('summary') || '';
+    const source = urlObj.searchParams.get('source') || '';
+    const sourceUrl = urlObj.searchParams.get('sourceUrl') || '';
+
+    if (!title || !summary) {
+        return { status: 400, body: { ok: false, error: 'Missing title or summary' } };
+    }
+
+    // Format the Facebook post message
+    const post = `${title}
+
+${summary}
+
+📰 Source: ${source}
+🔗 ${sourceUrl}
+
+#TechPulse #TechNews #AI #Technology`;
+
+    return {
+        status: 200,
+        body: {
+            ok: true,
+            step: 5,
+            post: {
+                message: post,
+                title,
+                summary,
+                source,
+                sourceUrl,
+            },
+            generatedAt: new Date().toISOString(),
+        },
+    };
+}
+
 // ── HTTP Server ─────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -880,12 +1092,45 @@ const server = createServer(async (req, res) => {
             status: 'ok',
             service: 'tech-news-api',
             gemini: GEMINI_API_KEY ? 'configured' : 'missing',
-            endpoints: ['/api/tech-news', '/api/tech-news/generate', '/health'],
+            endpoints: [
+                '/api/tech-news',
+                '/api/tech-news/generate',
+                '/api/step/pick',
+                '/api/step/title',
+                '/api/step/summary',
+                '/api/step/image-prompt',
+                '/api/step/compose',
+            ],
         }));
         return;
     }
 
-    // AI-generated tech news
+    // ── Step-by-step endpoints (for n8n pipeline) ──
+
+    const stepRoutes = {
+        '/api/step/pick': handleStepPick,
+        '/api/step/title': handleStepTitle,
+        '/api/step/summary': handleStepSummary,
+        '/api/step/image-prompt': handleStepImagePrompt,
+        '/api/step/compose': handleStepCompose,
+    };
+
+    if (stepRoutes[path]) {
+        try {
+            const result = await stepRoutes[path](urlObj);
+            res.writeHead(result.status, {
+                'Content-Type': 'application/json',
+                'Cache-Control': 'no-cache',
+            });
+            res.end(JSON.stringify(result.body, null, 2));
+        } catch (error) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: error?.message, retryAfter: 30 }));
+        }
+        return;
+    }
+
+    // AI-generated tech news (combined - legacy)
     if (path === '/api/tech-news/generate') {
         try {
             const result = await handleGenerateTechNews(urlObj);
@@ -919,12 +1164,20 @@ const server = createServer(async (req, res) => {
 
     // 404
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found', endpoints: ['/api/tech-news', '/api/tech-news/generate', '/health'] }));
+    res.end(JSON.stringify({ error: 'Not found' }));
 });
 
 server.listen(PORT, () => {
     console.log(`🚀 Tech News API running on port ${PORT}`);
-    console.log(`   → GET http://localhost:${PORT}/api/tech-news`);
-    console.log(`   → GET http://localhost:${PORT}/api/tech-news/generate`);
+    console.log(`   ── Step Pipeline (n8n) ──`);
+    console.log(`   → Step 1: GET /api/step/pick`);
+    console.log(`   → Step 2: GET /api/step/title`);
+    console.log(`   → Step 3: GET /api/step/summary`);
+    console.log(`   → Step 4: GET /api/step/image-prompt`);
+    console.log(`   → Step 5: GET /api/step/compose`);
+    console.log(`   ── Combined ──`);
+    console.log(`   → GET /api/tech-news`);
+    console.log(`   → GET /api/tech-news/generate`);
     console.log(`   → Gemini: ${GEMINI_API_KEY ? '✓ configured' : '✗ missing GEMINI_API_KEY'}`);
 });
+
